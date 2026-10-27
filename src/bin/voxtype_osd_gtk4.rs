@@ -5,9 +5,8 @@
 //! scrolling waveform plus a segmented peak meter. Audio frames arrive on
 //! the daemon's audio Unix socket via [`voxtype::osd::ipc::run_ipc_loop`],
 //! decoded into [`AudioFrame`]s by a tokio runtime on a worker thread, and
-//! pushed into a shared [`FrameRing`] + [`PeakHold`]. The GTK side polls a
-//! ~60 Hz `glib::timeout_add_local` callback that redraws the
-//! `DrawingArea` whenever new frames have arrived.
+//! pushed into a shared [`FrameRing`] + [`PeakHold`]. The GTK frame clock
+//! redraws the `DrawingArea` while visible, including between audio arrivals.
 //!
 //! When the IPC socket is silent for `idle_timeout_secs` (Idle proxy) the
 //! window is hidden so the binary does no rendering work and consumes
@@ -30,7 +29,8 @@ use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
 use voxtype::audio::levels::{AudioFrame, FRAME_HZ};
 use voxtype::config::Config as VoxtypeConfig;
 use voxtype::osd::config::{OsdConfig, OsdPosition};
-use voxtype::osd::ipc::{resolve_socket_path, run_ipc_loop, FrameRing, DEFAULT_RING_DEPTH};
+use voxtype::osd::gtk_env;
+use voxtype::osd::ipc::{resolve_socket_path, run_ipc_loop, FrameRing};
 use voxtype::osd::theme::ThemeWatcher;
 use voxtype::osd::visual::{peak_meter_fraction, project_envelope, MeterZone, Palette, PeakHold};
 
@@ -69,8 +69,7 @@ fn load_osd_config_from_file(explicit: Option<&std::path::Path>) -> OsdConfig {
 /// Application id for the GTK4 frontend.
 const APP_ID: &str = "io.voxtype.OsdGtk4";
 
-/// Render tick period (~60 Hz). The redraw is gated on whether new frames
-/// have arrived since the last paint, so this is a cheap upper bound.
+/// Visibility polling period. Drawing follows the GTK frame clock.
 const RENDER_TICK_MS: u32 = 16;
 
 /// How long we wait without frames before treating the daemon as idle and
@@ -149,15 +148,18 @@ struct Args {
 /// State shared between the IPC worker and the GTK redraw timer.
 struct SharedState {
     ring: Mutex<FrameRing>,
+    window_frames: f64,
     peak: Mutex<PeakHold>,
     last_seq: Mutex<u64>,
     last_frame_at: Mutex<Instant>,
 }
 
 impl SharedState {
-    fn new(decay_db_per_sec: f32) -> Self {
+    fn new(decay_db_per_sec: f32, window_secs: f32) -> Self {
+        let window_frames = window_secs.max(0.01) as f64 * FRAME_HZ as f64;
         Self {
-            ring: Mutex::new(FrameRing::new(DEFAULT_RING_DEPTH)),
+            ring: Mutex::new(FrameRing::for_window(window_secs)),
+            window_frames,
             peak: Mutex::new(PeakHold::new(decay_db_per_sec)),
             last_seq: Mutex::new(0),
             last_frame_at: Mutex::new(Instant::now() - Duration::from_secs(3600)),
@@ -166,12 +168,46 @@ impl SharedState {
 }
 
 fn main() -> anyhow::Result<()> {
+    // Keep GDK off dmabuf rendering. The OSD is a small overlay;
+    // shared-memory buffers cost nothing here. Respect an explicit
+    // GDK_DISABLE from the user (they may be working around something else,
+    // or testing the dmabuf path deliberately).
+    if std::env::var_os("GDK_DISABLE").is_none() {
+        std::env::set_var("GDK_DISABLE", "dmabuf");
+    }
+
+    // GDK_DISABLE=dmabuf does not stop GDK binding zwp_linux_dmabuf_v1 and
+    // handling its feedback, which is where unfixed GTK releases munmap the
+    // wrong pointer on output hotplug (gtk#8366; #580, #656). Only
+    // GDK_WAYLAND_DISABLE keeps the interface unbound. Must run before GDK
+    // opens the display.
+    let (major, minor, micro) = (
+        gtk4::major_version(),
+        gtk4::minor_version(),
+        gtk4::micro_version(),
+    );
+    let skip_dmabuf = gtk_env::gtk_lacks_dmabuf_feedback_fix(major, minor, micro);
+    if skip_dmabuf {
+        let existing = std::env::var("GDK_WAYLAND_DISABLE").ok();
+        std::env::set_var(
+            "GDK_WAYLAND_DISABLE",
+            gtk_env::wayland_disable_with(existing.as_deref(), gtk_env::LINUX_DMABUF_INTERFACE),
+        );
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .init();
+
+    if skip_dmabuf {
+        tracing::info!(
+            "GTK {major}.{minor}.{micro} predates the gtk#8366 fix; not binding {}",
+            gtk_env::LINUX_DMABUF_INTERFACE
+        );
+    }
 
     let args = Args::parse();
     let socket_path = resolve_socket_path(args.socket.clone());
@@ -207,7 +243,10 @@ fn main() -> anyhow::Result<()> {
     let theme = ThemeWatcher::new();
     let palette = theme.palette();
 
-    let state = Arc::new(SharedState::new(osd_cfg.peak_decay_db_per_sec));
+    let state = Arc::new(SharedState::new(
+        osd_cfg.peak_decay_db_per_sec,
+        osd_cfg.waveform_window_secs,
+    ));
 
     // Spawn the tokio IPC worker on a side thread.
     spawn_ipc_worker(
@@ -428,12 +467,17 @@ fn build_window(app: &Application, cfg: &OsdConfig, palette: Palette, state: Arc
         });
     }
 
-    // Redraw timer. We only call queue_draw() when the IPC has produced a
-    // newer seq than the last paint, so this is cheap when idle.
+    // GTK pauses tick callbacks while the widget is hidden. While visible,
+    // redraw even between audio deliveries so fractional scrolling continues.
+    drawing_area.add_tick_callback(|area, _clock| {
+        area.queue_draw();
+        glib::ControlFlow::Continue
+    });
+
+    // Visibility must be polled separately: a hidden widget has no frame clock
+    // ticks with which to notice the next recording.
     let redraw_state = state.clone();
-    let redraw_area = drawing_area.clone();
     let redraw_window = window.clone();
-    let last_drawn_seq = Cell::new(0u64);
     // Tracks GTK visibility. Starts true because `window.present()` below maps
     // the surface, the first tick's idle check then hides it.
     let visible = Cell::new(true);
@@ -486,10 +530,6 @@ fn build_window(app: &Application, cfg: &OsdConfig, palette: Palette, state: Arc
             }
         }
 
-        if cur_seq != last_drawn_seq.get() {
-            redraw_area.queue_draw();
-            last_drawn_seq.set(cur_seq);
-        }
         glib::ControlFlow::Continue
     });
 
@@ -542,20 +582,42 @@ fn draw(
     let gap = (w * 0.01).max(2.0);
     let wave_width = (w - meter_width - gap).max(0.0);
 
-    draw_waveform(cr, 0.0, 0.0, wave_width, h, palette, state, gain);
-    draw_peak_meter(cr, wave_width + gap, 0.0, meter_width, h, palette, state);
+    draw_waveform(
+        cr,
+        &Rect {
+            x: 0.0,
+            y: 0.0,
+            w: wave_width,
+            h,
+        },
+        palette,
+        state,
+        gain,
+    );
+    draw_peak_meter(
+        cr,
+        &Rect {
+            x: wave_width + gap,
+            y: 0.0,
+            w: meter_width,
+            h,
+        },
+        palette,
+        state,
+    );
 }
 
-fn draw_waveform(
-    cr: &Context,
+/// Pixel-space rectangle for the draw helpers, so geometry travels as one
+/// argument instead of four loose floats.
+struct Rect {
     x: f64,
     y: f64,
     w: f64,
     h: f64,
-    palette: &Palette,
-    state: &Arc<SharedState>,
-    gain: f64,
-) {
+}
+
+fn draw_waveform(cr: &Context, r: &Rect, palette: &Palette, state: &Arc<SharedState>, gain: f64) {
+    let Rect { x, y, w, h } = *r;
     if w < 1.0 {
         return;
     }
@@ -564,12 +626,18 @@ fn draw_waveform(
         return;
     }
 
-    // Collect frames as a Vec snapshot under the lock, then drop.
-    let frames: Vec<AudioFrame> = match state.ring.lock() {
-        Ok(r) => r.iter().collect(),
+    let cols = match state.ring.lock() {
+        Ok(r) => {
+            let frames: Vec<AudioFrame> = r.iter().collect();
+            project_envelope(
+                &frames,
+                n_columns,
+                state.window_frames,
+                r.scroll_offset(Instant::now()),
+            )
+        }
         Err(_) => return,
     };
-    let cols = project_envelope(&frames, n_columns);
 
     let mid = y + h * 0.5;
     let half = h * 0.5;
@@ -617,20 +685,11 @@ fn draw_waveform(
 }
 
 fn sample_to_pixels(sample: f32, half_height: f64, gain: f64) -> f64 {
-    // Apply visual gain, then clamp to -1.0..=1.0, then scale to half_height.
-    let s = (sample as f64 * gain).clamp(-1.0, 1.0);
-    s * half_height
+    (sample as f64 * gain).clamp(-1.0, 1.0) * half_height
 }
 
-fn draw_peak_meter(
-    cr: &Context,
-    x: f64,
-    y: f64,
-    w: f64,
-    h: f64,
-    palette: &Palette,
-    state: &Arc<SharedState>,
-) {
+fn draw_peak_meter(cr: &Context, r: &Rect, palette: &Palette, state: &Arc<SharedState>) {
+    let Rect { x, y, w, h } = *r;
     if w < 1.0 || h < 1.0 {
         return;
     }

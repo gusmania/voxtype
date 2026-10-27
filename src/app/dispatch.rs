@@ -9,7 +9,7 @@ use voxtype::{config, daemon, setup, transcribe, Cli, Commands, ConfigAction, Se
 
 use super::config_get::run_config_get;
 use super::config_schema::run_config_schema;
-use super::config_set::{run_config_set, run_config_unset};
+use super::config_set::{run_config_set, run_config_unset, run_setup_osd};
 use super::config_show::show_config;
 use super::info::run_info_command;
 use super::meeting::run_meeting_command;
@@ -289,6 +289,22 @@ pub(crate) async fn dispatch(
                         setup::gpu::show_status();
                     }
                 }
+                Some(SetupAction::Npu {
+                    enable,
+                    disable,
+                    status,
+                }) => {
+                    warn_if_root("npu");
+                    if status {
+                        setup::npu::show_status();
+                    } else if enable {
+                        setup::npu::enable()?;
+                    } else if disable {
+                        setup::npu::disable()?;
+                    } else {
+                        setup::npu::show_status();
+                    }
+                }
                 Some(SetupAction::Variant { to }) => {
                     let variant =
                         setup::binary::Variant::from_binary_name(&to).ok_or_else(|| {
@@ -338,6 +354,14 @@ pub(crate) async fn dispatch(
                     } else {
                         setup::vad::download_model()?;
                     }
+                }
+                Some(SetupAction::Osd {
+                    recipe,
+                    list,
+                    dry_run,
+                }) => {
+                    warn_if_root("osd");
+                    run_setup_osd(cli.config.clone(), recipe, list, dry_run)?;
                 }
                 Some(SetupAction::Quickshell {
                     target,

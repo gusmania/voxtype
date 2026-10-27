@@ -77,6 +77,20 @@ max_duration_secs = 60
 # instant behavior.
 # duck_media_fade_ms = 150
 
+# Auto-stop an external-trigger recording (`voxtype record start`, e.g. from
+# a wake-word integration) after this many seconds of silence. Unset by
+# default: the recording only ends on an explicit `record stop`/`record
+# toggle`. Never applies to hotkey-driven push-to-talk/toggle recordings,
+# which already have an explicit user-driven stop.
+# external_trigger_silence_timeout_secs = 2.0
+
+# Peak level (dBFS) at or above which a frame counts as speech for
+# external_trigger_silence_timeout_secs above. -20 sits above typical
+# laptop-mic noise (~-30 dBFS); raise it (toward 0) on a noisier mic,
+# lower it if soft speech isn't resetting the silence timer. A frame only
+# counts once a short burst sustains it, so stray noise spikes don't count.
+# external_trigger_speech_threshold_dbfs = -20.0
+
 # [audio.feedback]
 # Enable audio feedback sounds (beeps when recording starts/stops)
 # enabled = true
@@ -154,11 +168,10 @@ translate = false
 # Reduces perceived latency on slower machines by processing audio in parallel.
 # eager_processing = false
 #
-# Duration of each audio chunk in seconds (default: 5.0)
+# Nominal duration of each audio chunk in seconds (default: 5.0). Each chunk
+# ends at the quietest point in the last 1.5s before this length, so cuts fall
+# between words and chunks never overlap.
 # eager_chunk_secs = 5.0
-#
-# Overlap between chunks in seconds (helps catch words at boundaries, default: 0.5)
-# eager_overlap_secs = 0.5
 
 # --- Remote backend settings (used when backend = "remote") ---
 #
